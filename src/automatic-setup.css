@@ -1,0 +1,7 @@
+.version strong{display:block;font-size:10px;color:#2d3136;white-space:nowrap}
+.site-name-field{display:flex;align-items:center;border:1px solid var(--border);border-radius:6px;background:#fff;overflow:hidden}
+.site-name-field:focus-within{border-color:#7cbcf5;box-shadow:0 0 0 3px #0071e312}
+.site-name-field input{border:0;border-radius:0;box-shadow:none!important;min-width:0}
+.site-name-field span{padding:0 9px;color:#747984;font-size:9px;border-left:1px solid var(--border-light);background:#f7f8fa;align-self:stretch;display:flex;align-items:center}
+.requirements.detailed .auto-state{width:auto;height:auto;border-radius:999px;background:#f2f4f7;color:#737984;padding:3px 6px;font-size:7px;font-weight:650}
+.requirements.detailed .requirement-row>span.ok:first-child~.auto-state{background:#e9f8f0;color:#17824a}

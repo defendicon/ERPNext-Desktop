@@ -1,0 +1,28 @@
+/* Readable desktop scale — designed for comfortable viewing at 100% Windows scaling. */
+.shell{grid-template-columns:268px minmax(0,1fr)}
+.rail{width:268px;padding:18px 14px 15px}
+.brand{height:48px;font-size:14px;gap:11px}.brand b{font-size:18px}.brand-mark{width:36px;height:36px}
+.rail nav{gap:5px;margin-top:30px;padding-top:34px}.rail nav:before{font-size:10px}.rail nav a{min-height:43px;padding:10px 12px;font-size:14px;gap:11px}
+.rail-foot{padding:13px}.rail-foot b{font-size:13px}.rail-foot small{font-size:11px;line-height:1.4}.status-dot{width:9px;height:9px}
+.content{padding:0 32px 42px}.topbar{height:154px;padding:30px 0 24px}.topbar:before{top:19px;font-size:11px}.topbar h1{font-size:34px;margin-bottom:8px}.topbar p{font-size:15px;line-height:1.5}
+.version{padding:10px 13px}.version small{font-size:10px}.version strong{font-size:13px}
+.workspace{grid-template-columns:minmax(620px,1fr) 340px;gap:24px;padding-top:26px}.section-head{margin-bottom:16px}.section-head h2{font-size:22px}.section-head span{font-size:13px}
+.search{padding:10px 12px}.search input{width:155px;font-size:13px}
+.notice{padding:13px 15px;gap:11px;margin-bottom:14px}.notice b{font-size:13px;margin-bottom:4px}.notice span{font-size:11.5px;line-height:1.5}
+.apps-grid{gap:11px}.app-card{min-height:108px;grid-template-columns:46px 1fr;gap:12px;padding:15px 42px 14px 14px}.app-icon{width:42px;height:42px}.app-icon svg{width:21px;height:21px}.app-copy strong{font-size:14px;margin:2px 0 6px}.app-copy small{font-size:11.5px;line-height:1.48}.app-meta{top:13px;right:12px;font-size:9px}.tick{right:12px;bottom:12px;width:22px;height:22px}
+.summary{padding:21px;border-radius:12px}.summary-top span{font-size:10px}.summary-top b{font-size:10px;padding:5px 8px}.metric{padding:19px 0 16px;margin-bottom:16px}.metric span{font-size:46px}.metric small{font-size:12px;margin-bottom:5px}
+.field{margin:12px 0}.field label{font-size:10px;margin-bottom:7px}.field input{padding:11px 12px;font-size:14px}.site-name-field span{font-size:12px;padding:0 11px}
+.automatic-note{display:flex;align-items:flex-start;gap:10px;margin:16px 0;padding:12px;border:1px solid #d7e9fa;background:#f3f9ff;color:#1868ad;border-radius:8px}.automatic-note svg{flex:0 0 auto}.automatic-note b,.automatic-note span{display:block}.automatic-note b{font-size:12px;margin-bottom:3px}.automatic-note span{font-size:10.5px;line-height:1.45;color:#58738c}
+.primary{padding:13px;font-size:13px;border-radius:8px}.fineprint{font-size:10.5px;line-height:1.55;margin-top:12px}.message{font-size:12px;padding:11px;line-height:1.5}.uninstall-zone{margin-top:16px;padding-top:13px}.uninstall-zone>b{font-size:9px}.uninstall-zone button{font-size:11px;padding:7px 4px}
+.dialog-card{width:460px;padding:28px}.dialog-card h3{font-size:22px}.dialog-card p{font-size:13px}.dialog-actions button{font-size:12px;padding:10px 14px}
+
+.setup-progress-screen{position:fixed;inset:0;z-index:100;background:linear-gradient(145deg,#f4f9ff 0%,#fff 45%,#edf6ff 100%);display:grid;grid-template-rows:auto 1fr;padding:28px 38px;animation:progress-in .22s ease-out}
+.progress-brand{display:flex;align-items:center;gap:12px;color:#3d4148;font-size:17px}.progress-brand b{color:#15171a}.progress-panel{width:min(760px,80vw);align-self:center;justify-self:center;text-align:center;margin-top:-48px}
+.progress-kicker{display:block;color:#0071e3;font-size:13px;font-weight:750;letter-spacing:.18em}.progress-number{font-size:112px;line-height:1.05;font-weight:760;letter-spacing:-.07em;color:#17191c;margin:16px 0 13px}.progress-number small{font-size:42px;color:#0071e3;letter-spacing:-.02em;margin-left:6px}
+.progress-track{height:15px;background:#dce8f5;border-radius:999px;overflow:hidden;box-shadow:inset 0 1px 2px #24496d1f}.progress-track div{height:100%;border-radius:inherit;background:linear-gradient(90deg,#0071e3,#23a3ff);transition:width .45s ease;position:relative}.progress-track div:after{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 25%,#ffffff55 45%,transparent 65%);animation:shimmer 1.6s linear infinite}
+.progress-panel h2{font-size:28px;line-height:1.2;margin:25px 0 8px;letter-spacing:-.02em}.progress-panel>p{font-size:15px;line-height:1.55;color:#626b76;margin:0 auto;max-width:640px;min-height:24px}
+.current-download{display:flex;align-items:center;text-align:left;gap:13px;width:min(520px,100%);margin:24px auto 20px;padding:15px 18px;border:1px solid #d5e5f5;background:#fff;border-radius:12px;box-shadow:0 9px 30px #2e619a12;color:#0071e3}.current-download div{min-width:0}.current-download span,.current-download strong{display:block}.current-download span{font-size:10px;letter-spacing:.13em;font-weight:750;color:#7b8490;margin-bottom:4px}.current-download strong{font:600 14px "Cascadia Code",Consolas,monospace;color:#26323d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.progress-steps{display:flex;justify-content:center;gap:9px;margin-top:10px}.progress-steps span{font-size:11px;font-weight:650;color:#9ba3ad;background:#eef1f5;border-radius:999px;padding:7px 12px}.progress-steps span.active{color:#056acb;background:#e4f2ff}.progress-steps span.done{color:#18794e;background:#e8f7ef}.progress-footnote{display:block;font-size:11px;color:#808894;margin-top:21px}
+@keyframes shimmer{from{transform:translateX(-100%)}to{transform:translateX(100%)}}@keyframes progress-in{from{opacity:0}to{opacity:1}}
+
+@media(max-width:1250px){.shell{grid-template-columns:238px}.rail{width:238px}.content{grid-column:2;padding-left:22px;padding-right:22px}.workspace{grid-template-columns:minmax(570px,1fr) 320px}.app-card{min-height:112px}.topbar h1{font-size:31px}}
