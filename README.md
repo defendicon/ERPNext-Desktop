@@ -41,6 +41,19 @@ Build a Windows NSIS installer:
 npm run dist:win
 ```
 
+## Automated GitHub releases
+
+Every push or pull request to `main` runs the Windows packaging check and stores the generated installer as a temporary Actions artifact.
+
+To publish a permanent GitHub Release, first update the version in `package.json` and `package-lock.json`, commit it, then push a matching tag:
+
+```powershell
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+The release workflow builds the NSIS installer on a clean Windows runner and publishes the `.exe`, update blockmap and `SHA256SUMS` file on the matching GitHub Release.
+
 Rust is not required. The Windows app detects and installs missing prerequisites automatically; Windows may require one UAC confirmation and a restart after enabling WSL 2.
 
 ## Safety and production notes
