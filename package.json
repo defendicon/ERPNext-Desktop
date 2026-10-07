@@ -1,6 +1,6 @@
 {
   "name": "erpnext-desktop-manager",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Windows desktop installer and manager for ERPNext and official Frappe apps.",
   "main": "electron/main.cjs",

@@ -19,12 +19,30 @@ const APP_CATALOG = {
 
 function run(command, args, options = {}, onLine = () => {}) {
   return new Promise((resolve, reject) => {
+    const output = { stdout: [], stderr: [] };
     const child = spawn(command, args, { ...options, windowsHide: true, shell: false });
-    const pump = (kind) => (chunk) => String(chunk).split(/\r?\n/).filter(Boolean).forEach((line) => onLine({ kind, line }));
+    const pump = (kind) => (chunk) => String(chunk).split(/\r?\n/).filter(Boolean).forEach((line) => {
+      output[kind].push(line);
+      if (output[kind].length > 80) output[kind].shift();
+      onLine({ kind, line });
+    });
     child.stdout?.on('data', pump('stdout'));
     child.stderr?.on('data', pump('stderr'));
     child.on('error', reject);
-    child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`${command} exited with code ${code}`)));
+    child.on('close', (code) => {
+      if (code === 0) return resolve({ stdout: output.stdout.join('\n'), stderr: output.stderr.join('\n') });
+      const details = [...output.stderr, ...output.stdout]
+        .map((line) => line.replace(/\0/g, '').replace(/\x1b\[[0-9;]*m/g, '').trim())
+        .filter(Boolean)
+        .slice(-12)
+        .join('\n')
+        .slice(-2400);
+      const error = new Error(`${path.basename(command)} exited with code ${code}${details ? `:\n${details}` : ''}`);
+      error.code = code;
+      error.stdout = output.stdout.join('\n');
+      error.stderr = output.stderr.join('\n');
+      reject(error);
+    });
   });
 }
 
@@ -43,13 +61,28 @@ async function resolveTools() {
     path.join(localAppData, 'Programs', 'Git', 'cmd', 'git.exe')
   ]);
   const docker = await firstExisting([
-    path.join(programFiles, 'Docker', 'Docker', 'resources', 'bin', 'docker.exe')
+    path.join(programFiles, 'Docker', 'Docker', 'resources', 'bin', 'docker.exe'),
+    path.join(localAppData, 'Programs', 'DockerDesktop', 'resources', 'bin', 'docker.exe')
   ]);
   return { git: git || 'git', docker: docker || 'docker' };
 }
 
 async function commandExists(command, args = ['--version']) {
   try { await run(command, args); return true; } catch { return false; }
+}
+
+async function windowsRestartPending() {
+  const keys = [
+    'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending',
+    'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired'
+  ];
+  for (const key of keys) {
+    if (await commandExists('reg.exe', ['query', key])) return true;
+  }
+  // PendingFileRenameOperations is intentionally ignored here. Browsers and
+  // updaters commonly leave unrelated entries behind after a successful boot,
+  // so treating it as a WSL/Docker restart signal creates a permanent loop.
+  return false;
 }
 
 async function preflight() {
@@ -62,7 +95,7 @@ async function preflight() {
     commandExists('wsl.exe', ['--status'])
   ]);
   let engine = false;
-  if (docker) engine = await commandExists(tools.docker, ['info']);
+  if (docker) engine = await commandExists(tools.docker, ['ps', '--format', '{{.ID}}']);
   return { docker, compose, git, engine, winget, wsl, ready: docker && compose && git && engine };
 }
 
@@ -84,23 +117,80 @@ async function installRequirement(id, emit = () => {}) {
   }
   emit({ kind: 'progress', phase: `Installing ${requirement.label}`, image: requirement.wingetId, line: `Downloading ${requirement.label} silently.` });
   emit({ kind: 'progress', line: `Downloading ${requirement.label} from its verified winget package…` });
-  await run('winget.exe', [
+  const args = [
     'install', '--id', requirement.wingetId, '--exact', '--source', 'winget',
     '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity', '--silent'
-  ], {}, emit);
-  return { id, installed: true, restartRequired: id === 'docker' };
+  ];
+  if (id === 'docker') {
+    args.push('--override', 'install --quiet --accept-license --backend=wsl-2 --always-run-service');
+  }
+  await run('winget.exe', args, {}, emit);
+  return { id, installed: true, restartRequired: false };
 }
 
-async function startDockerDesktop() {
+async function startDockerDesktop(emit = () => {}) {
+  const tools = await resolveTools();
+  if (await commandExists(tools.docker, ['desktop', 'version'])) {
+    try {
+      await run(tools.docker, ['desktop', 'start', '--detach'], {}, emit);
+      return { started: true, method: 'cli' };
+    } catch { /* Older or unhealthy Desktop versions can require the executable fallback. */ }
+  }
   const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
-  const executable = await firstExisting([path.join(programFiles, 'Docker', 'Docker', 'Docker Desktop.exe')]);
+  const localAppData = process.env.LOCALAPPDATA || '';
+  const executable = await firstExisting([
+    path.join(programFiles, 'Docker', 'Docker', 'Docker Desktop.exe'),
+    path.join(localAppData, 'Programs', 'DockerDesktop', 'Docker Desktop.exe')
+  ]);
   if (!executable) throw new Error('Docker Desktop is not installed.');
   const child = spawn(executable, ['--minimized'], { detached: true, windowsHide: true, stdio: 'ignore' });
   child.unref();
-  return { started: true };
+  return { started: true, method: 'executable' };
 }
 
 const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function waitForDockerEngine(tools, emit = () => {}, attempts = 150) {
+  let lastError;
+  let recoverableFailures = 0;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      await run(tools.docker, ['ps', '--format', '{{.ID}}']);
+      return true;
+    } catch (error) {
+      lastError = error;
+      recoverableFailures = isRecoverableDockerError(error) ? recoverableFailures + 1 : 0;
+      if (recoverableFailures >= 3) throw error;
+    }
+    if (attempt % 10 === 0) emit({ kind: 'progress', line: 'Waiting for the Docker engine to become ready…', progress: 15 });
+    await pause(2000);
+  }
+  throw lastError || new Error('Docker engine did not become ready.');
+}
+
+function isRecoverableDockerError(error) {
+  return /Docker Desktop is unable to start|DockerDesktop\/Wsl\/ExecError|dockerDesktopLinuxEngine\/_ping|500 Internal Server Error/i.test(String(error?.message || error));
+}
+
+async function recoverDockerEngine(emit = () => {}) {
+  const tools = await resolveTools();
+  emit({ kind: 'progress', phase: 'Repairing the Docker engine', image: 'Docker Desktop + WSL 2', line: 'Restarting the private Docker WSL engine in the background.', progress: 20 });
+  try { await run(tools.docker, ['desktop', 'stop']); } catch { /* It may already be stopped. */ }
+  try { await run('wsl.exe', ['--terminate', 'docker-desktop']); } catch { /* The distro may not be running yet. */ }
+  await startDockerDesktop(emit);
+  await waitForDockerEngine(tools, emit, 90);
+  return true;
+}
+
+async function runDocker(tools, args, options, onLine, allowRecovery = true) {
+  try {
+    return await run(tools.docker, args, options, onLine);
+  } catch (error) {
+    if (!allowRecovery || !isRecoverableDockerError(error)) throw error;
+    await recoverDockerEngine(onLine);
+    return run(tools.docker, args, options, onLine);
+  }
+}
 
 async function ensureRequirements(emit = () => {}) {
   emit({ kind: 'progress', phase: 'Checking Windows requirements', image: 'System readiness scan', line: 'Checking WSL, Git, Docker Desktop and Docker Compose.', progress: 2 });
@@ -127,23 +217,30 @@ async function ensureRequirements(emit = () => {}) {
     restartRequired ||= result.restartRequired;
   }
 
+  if (restartRequired) {
+    throw new Error('Windows must restart to finish WSL 2 setup. Docker Desktop is installed and no login is required. Restart the PC, reopen ERPNext Desktop, and click Install—the selected apps are saved.');
+  }
+
   status = await preflight();
+  if (!status.engine && await windowsRestartPending()) {
+    throw new Error('Windows has a pending restart from WSL 2 or Docker setup. Restart the PC, reopen ERPNext Desktop, and click Install—the selected apps are saved and no Docker login is required.');
+  }
   if (!status.engine && status.docker) {
     emit({ kind: 'progress', phase: 'Starting the container engine', image: 'Docker Desktop', line: 'Starting Docker Desktop in the background.', progress: 20 });
     emit({ kind: 'progress', line: 'Starting Docker Desktop…', progress: 14 });
-    await startDockerDesktop();
+    await startDockerDesktop(emit);
     const tools = await resolveTools();
-    for (let attempt = 0; attempt < 150; attempt += 1) {
-      if (await commandExists(tools.docker, ['info'])) break;
-      if (attempt % 10 === 0) emit({ kind: 'progress', line: 'Waiting for the Docker engine to become ready…', progress: 15 });
-      await pause(2000);
+    try { await waitForDockerEngine(tools, emit); }
+    catch (error) {
+      if (!isRecoverableDockerError(error)) throw error;
+      await recoverDockerEngine(emit);
     }
   }
 
   status = await preflight();
   if (!status.ready) {
     if (restartRequired) throw new Error('Windows must restart to finish WSL 2 and Docker setup. Restart the PC, reopen ERPNext Desktop, and click Install—the selected apps are saved.');
-    throw new Error('Automatic prerequisite setup did not finish. Open Docker Desktop once, accept its first-run prompt if shown, then click Install again.');
+    throw new Error('Docker Desktop did not become ready. Restart Windows, reopen ERPNext Desktop, and click Install again; no Docker login is required.');
   }
   emit({ kind: 'progress', phase: 'Windows requirements are ready', image: 'WSL 2 + Git + Docker Desktop', line: 'All prerequisites are installed and running.', progress: 24 });
   return status;
@@ -157,9 +254,15 @@ function imageFromLine(line, fallback = '') {
 
 function progressReporter(emit, phase, fallbackImage, from, to) {
   let value = from;
-  return ({ kind, line }) => {
+  return ({ kind, line, phase: reportedPhase, image: reportedImage, progress: reportedProgress }) => {
     value = Math.min(to, value + 1);
-    emit({ kind, phase, image: imageFromLine(line, fallbackImage), line, progress: value });
+    emit({
+      kind,
+      phase: reportedPhase || phase,
+      image: reportedImage || imageFromLine(line, fallbackImage),
+      line,
+      progress: reportedProgress === undefined ? value : reportedProgress
+    });
   };
 }
 
@@ -225,6 +328,8 @@ async function install(raw, appDataDir, emit) {
   const plan = makePlan({ ...raw, port, version: '16' }, rootDir);
   await ensureRequirements(emit);
   const tools = await resolveTools();
+  try { await runDocker(tools, ['ps', '--format', '{{.ID}}'], {}, () => {}); }
+  catch (error) { throw new Error(`Docker's Linux engine could not be prepared. ${error.message}`); }
   await mkdir(rootDir, { recursive: true });
   const dockerDir = path.join(rootDir, 'frappe_docker');
   emit({ kind: 'progress', phase: 'Downloading ERPNext build tools', image: 'frappe/frappe_docker', line: 'Getting the official Frappe Docker configuration.', progress: 26 });
@@ -234,7 +339,7 @@ async function install(raw, appDataDir, emit) {
   await writeFile(appsPath, JSON.stringify(plan.apps.map(({ url, branch }) => ({ url, branch })), null, 2));
   emit({ kind: 'progress', line: 'Building the selected official apps…', progress: 28 });
   emit({ kind: 'progress', phase: 'Building your ERPNext image', image: plan.image, line: 'Downloading image layers and adding the selected official apps.', progress: 32 });
-  await run(tools.docker, ['build', '--progress', 'plain', '--build-arg', `FRAPPE_BRANCH=version-${plan.config.version}`, '--secret', `id=apps_json,src=${appsPath}`, '--tag', plan.image, '--file', 'images/layered/Containerfile', '.'], { cwd: dockerDir }, progressReporter(emit, 'Building your ERPNext image', plan.image, 32, 79));
+  await runDocker(tools, ['build', '--progress', 'plain', '--build-arg', `FRAPPE_BRANCH=version-${plan.config.version}`, '--secret', `id=apps_json,src=${appsPath}`, '--tag', plan.image, '--file', 'images/layered/Containerfile', '.'], { cwd: dockerDir }, progressReporter(emit, 'Building your ERPNext image', plan.image, 32, 79));
   const dbPassword = crypto.randomBytes(24).toString('base64url');
   const adminPassword = plan.config.adminPassword || crypto.randomBytes(14).toString('base64url');
   await writeFile(path.join(rootDir, 'compose.yaml'), composeYaml(plan, dbPassword, adminPassword));
@@ -242,7 +347,7 @@ async function install(raw, appDataDir, emit) {
   emit({ kind: 'progress', line: 'Starting ERPNext services…', progress: 82 });
   emit({ kind: 'progress', phase: 'Preparing your site', image: plan.config.siteName, line: 'Writing the private local configuration and credentials.', progress: 82 });
   emit({ kind: 'progress', phase: 'Starting ERPNext services', image: 'mariadb:10.11 + redis:7-alpine', line: 'Downloading the database and cache images.', progress: 86 });
-  await run(tools.docker, ['compose', '--progress', 'plain', '-f', 'compose.yaml', 'up', '-d'], { cwd: rootDir }, progressReporter(emit, 'Starting ERPNext services', plan.image, 86, 98));
+  await runDocker(tools, ['compose', '--progress', 'plain', '-f', 'compose.yaml', 'up', '-d'], { cwd: rootDir }, progressReporter(emit, 'Starting ERPNext services', plan.image, 86, 98));
   emit({ kind: 'progress', phase: 'ERPNext is ready', image: plan.config.siteName, line: 'Your local ERP workspace is ready to open.', progress: 100 });
   return { ...plan, url: `http://127.0.0.1:${plan.config.port}`, adminPassword };
 }
