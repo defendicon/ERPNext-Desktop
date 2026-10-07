@@ -6,7 +6,7 @@ A Windows-first desktop installer and local manager for ERPNext. It presents ERP
 
 - Electron desktop shell with a production Vite/React interface.
 - Real checks for Git, Docker Desktop, Docker Compose v2, and a running Docker engine.
-- Automatic silent installation of WSL 2, Git and Docker Desktop through official Windows mechanisms.
+- Automatic detection and enablement of Windows Subsystem for Linux, Virtual Machine Platform, Git and Docker Desktop through official Windows mechanisms.
 - Administrator permission requested once when ERPNext Desktop starts.
 - Full-screen installation progress with the active prerequisite, package or Docker image name.
 - Selectable official-app catalog. ERPNext Core is always included.
@@ -54,7 +54,7 @@ git push origin v0.1.1
 
 The release workflow builds the NSIS installer on a clean Windows runner and publishes the `.exe`, update blockmap and `SHA256SUMS` file on the matching GitHub Release.
 
-Rust is not required. The Windows app detects and installs missing prerequisites automatically; Windows may require one UAC confirmation and a restart after enabling WSL 2.
+Rust is not required. The Windows app detects and enables missing prerequisites automatically; Windows may require one UAC confirmation and a restart before Docker starts. If Intel or AMD hardware virtualization is disabled, enable it manually in BIOS/UEFI because the app cannot change firmware settings.
 
 ## Safety and production notes
 
