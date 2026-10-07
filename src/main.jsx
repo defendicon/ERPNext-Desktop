@@ -20,7 +20,16 @@ const catalog = [
 ];
 
 const bridge = window.erpDesktop || {
-  preflight: async () => ({ docker: false, compose: false, git: false, engine: false, wsl: false, ready: false }),
+  preflight: async () => ({
+    docker: false,
+    compose: false,
+    git: false,
+    engine: false,
+    wsl: false,
+    features: { wsl: 'unknown', virtualMachinePlatform: 'unknown' },
+    firmwareVirtualization: null,
+    ready: false
+  }),
   installRequirement: async () => { throw new Error('Requirement installation is available in the Windows desktop app.'); },
   startDocker: async () => {},
   startInstall: async () => { throw new Error('Open this screen in the Windows desktop app to start installation.'); },

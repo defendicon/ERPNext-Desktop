@@ -3,6 +3,11 @@ const { mkdir, writeFile, access, rm } = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const net = require('node:net');
+const {
+  REQUIRED_FEATURES,
+  enableWindowsFeatures,
+  inspectWindowsRequirements
+} = require('./windows-requirements.cjs');
 
 const APP_CATALOG = {
   erpnext: { url: 'https://github.com/frappe/erpnext', branches: { 15: 'version-15', 16: 'version-16' } },
@@ -17,19 +22,45 @@ const APP_CATALOG = {
   wiki: { url: 'https://github.com/frappe/wiki', branches: { 15: 'master', 16: 'master' } }
 };
 
+function createLineCollector(onLine) {
+  let remainder = '';
+  return {
+    push(chunk) {
+      remainder += String(chunk);
+      let newlineIndex = remainder.indexOf('\n');
+      while (newlineIndex !== -1) {
+        const line = remainder.slice(0, newlineIndex).replace(/\r$/, '');
+        remainder = remainder.slice(newlineIndex + 1);
+        if (line) onLine(line);
+        newlineIndex = remainder.indexOf('\n');
+      }
+    },
+    flush() {
+      const line = remainder.replace(/\r$/, '');
+      remainder = '';
+      if (line) onLine(line);
+    }
+  };
+}
+
 function run(command, args, options = {}, onLine = () => {}) {
   return new Promise((resolve, reject) => {
     const output = { stdout: [], stderr: [] };
     const child = spawn(command, args, { ...options, windowsHide: true, shell: false });
-    const pump = (kind) => (chunk) => String(chunk).split(/\r?\n/).filter(Boolean).forEach((line) => {
+    const collectors = {};
+    const collectorFor = (kind) => createLineCollector((line) => {
       output[kind].push(line);
       if (output[kind].length > 80) output[kind].shift();
       onLine({ kind, line });
     });
-    child.stdout?.on('data', pump('stdout'));
-    child.stderr?.on('data', pump('stderr'));
+    collectors.stdout = collectorFor('stdout');
+    collectors.stderr = collectorFor('stderr');
+    child.stdout?.on('data', (chunk) => collectors.stdout.push(chunk));
+    child.stderr?.on('data', (chunk) => collectors.stderr.push(chunk));
     child.on('error', reject);
     child.on('close', (code) => {
+      collectors.stdout.flush();
+      collectors.stderr.flush();
       if (code === 0) return resolve({ stdout: output.stdout.join('\n'), stderr: output.stderr.join('\n') });
       const details = [...output.stderr, ...output.stdout]
         .map((line) => line.replace(/\0/g, '').replace(/\x1b\[[0-9;]*m/g, '').trim())
@@ -85,18 +116,33 @@ async function windowsRestartPending() {
   return false;
 }
 
-async function preflight() {
-  const tools = await resolveTools();
-  const [docker, compose, git, winget, wsl] = await Promise.all([
-    commandExists(tools.docker),
-    commandExists(tools.docker, ['compose', 'version']),
-    commandExists(tools.git),
-    commandExists('winget.exe', ['--version']),
-    commandExists('wsl.exe', ['--status'])
+async function preflight(dependencies = {}) {
+  const getTools = dependencies.resolveTools || resolveTools;
+  const exists = dependencies.commandExists || commandExists;
+  const inspectRequirements = dependencies.inspectWindowsRequirements || (() => inspectWindowsRequirements(run));
+  const tools = await getTools();
+  const [docker, compose, git, winget, wsl, windowsRequirements] = await Promise.all([
+    exists(tools.docker),
+    exists(tools.docker, ['compose', 'version']),
+    exists(tools.git),
+    exists('winget.exe', ['--version']),
+    exists('wsl.exe', ['--status']),
+    inspectRequirements()
   ]);
   let engine = false;
-  if (docker) engine = await commandExists(tools.docker, ['ps', '--format', '{{.ID}}']);
-  return { docker, compose, git, engine, winget, wsl, ready: docker && compose && git && engine };
+  if (docker) engine = await exists(tools.docker, ['ps', '--format', '{{.ID}}']);
+  const featuresReady = windowsRequirements.features.wsl === 'enabled' &&
+    windowsRequirements.features.virtualMachinePlatform === 'enabled';
+  return {
+    docker,
+    compose,
+    git,
+    engine,
+    winget,
+    wsl,
+    ...windowsRequirements,
+    ready: docker && compose && git && engine && featuresReady
+  };
 }
 
 const REQUIREMENTS = {
@@ -192,54 +238,92 @@ async function runDocker(tools, args, options, onLine, allowRecovery = true) {
   }
 }
 
-async function ensureRequirements(emit = () => {}) {
+function restartRequiredError() {
+  return new Error('Windows must restart to finish WSL 2 and virtualization setup. Restart Windows, reopen ERPNext Desktop, and click Install—the selected apps are saved and no Docker login is required.');
+}
+
+async function ensureRequirements(emit = () => {}, dependencies = {}) {
+  const checkPreflight = dependencies.preflight || preflight;
+  const enableFeatures = dependencies.enableWindowsFeatures || ((names, report) => enableWindowsFeatures(run, names, report));
+  const installMissingRequirement = dependencies.installRequirement || installRequirement;
+  const hasPendingRestart = dependencies.windowsRestartPending || windowsRestartPending;
+  const startDocker = dependencies.startDockerDesktop || startDockerDesktop;
+  const getTools = dependencies.resolveTools || resolveTools;
+  const waitForEngine = dependencies.waitForDockerEngine || waitForDockerEngine;
+  const recoverEngine = dependencies.recoverDockerEngine || recoverDockerEngine;
+
   emit({ kind: 'progress', phase: 'Checking Windows requirements', image: 'System readiness scan', line: 'Checking WSL, Git, Docker Desktop and Docker Compose.', progress: 2 });
-  let status = await preflight();
+  let status = await checkPreflight();
   let restartRequired = false;
+
+  if (status.firmwareVirtualization === false) {
+    throw new Error('Hardware virtualization is disabled. Enable Intel VT-x/VT-d or AMD-V/SVM in BIOS/UEFI, restart Windows, then reopen ERPNext Desktop. This firmware setting cannot be enabled automatically.');
+  }
+
+  const initialFeatureStates = Object.values(status.features);
+  if (initialFeatureStates.includes('restart-pending')) throw restartRequiredError();
+  if (initialFeatureStates.includes('unknown')) {
+    throw new Error('Unable to inspect required Windows virtualization features. No changes were made.');
+  }
+
+  const missingFeatures = Object.entries(status.features)
+    .filter(([, state]) => state === 'disabled')
+    .map(([id]) => REQUIRED_FEATURES[id]);
+  if (missingFeatures.length > 0) {
+    const result = await enableFeatures(missingFeatures, emit);
+    if (result.restartNeeded) throw restartRequiredError();
+
+    status = await checkPreflight();
+    const updatedFeatureStates = Object.values(status.features);
+    if (updatedFeatureStates.includes('restart-pending')) throw restartRequiredError();
+    if (updatedFeatureStates.some((state) => state !== 'enabled')) {
+      throw new Error('Windows could not finish enabling the required virtualization features. Restart Windows, reopen ERPNext Desktop, and click Install again.');
+    }
+  }
 
   if (!status.wsl) {
     emit({ kind: 'progress', phase: 'Installing Windows Subsystem for Linux', image: 'Microsoft.WSL', line: 'Downloading and enabling WSL 2 silently.', progress: 5 });
     emit({ kind: 'progress', line: 'Enabling Windows Subsystem for Linux…', progress: 4 });
-    const result = await installRequirement('wsl', emit);
+    const result = await installMissingRequirement('wsl', emit);
     restartRequired ||= result.restartRequired;
   }
   if (!status.git) {
     emit({ kind: 'progress', phase: 'Installing Git', image: 'Git.Git', line: 'Downloading the verified Git for Windows package.', progress: 9 });
     emit({ kind: 'progress', line: 'Installing Git from the official Windows package…', progress: 7 });
-    await installRequirement('git', emit);
+    await installMissingRequirement('git', emit);
   }
 
-  status = await preflight();
+  status = await checkPreflight();
   if (!status.docker || !status.compose) {
     emit({ kind: 'progress', phase: 'Installing Docker Desktop', image: 'Docker.DockerDesktop', line: 'Downloading Docker Desktop and Docker Compose silently.', progress: 14 });
     emit({ kind: 'progress', line: 'Installing Docker Desktop and Docker Compose…', progress: 11 });
-    const result = await installRequirement('docker', emit);
+    const result = await installMissingRequirement('docker', emit);
     restartRequired ||= result.restartRequired;
   }
 
   if (restartRequired) {
-    throw new Error('Windows must restart to finish WSL 2 setup. Docker Desktop is installed and no login is required. Restart the PC, reopen ERPNext Desktop, and click Install—the selected apps are saved.');
+    throw restartRequiredError();
   }
 
-  status = await preflight();
-  if (!status.engine && await windowsRestartPending()) {
-    throw new Error('Windows has a pending restart from WSL 2 or Docker setup. Restart the PC, reopen ERPNext Desktop, and click Install—the selected apps are saved and no Docker login is required.');
+  status = await checkPreflight();
+  if (!status.engine && await hasPendingRestart()) {
+    throw restartRequiredError();
   }
   if (!status.engine && status.docker) {
     emit({ kind: 'progress', phase: 'Starting the container engine', image: 'Docker Desktop', line: 'Starting Docker Desktop in the background.', progress: 20 });
     emit({ kind: 'progress', line: 'Starting Docker Desktop…', progress: 14 });
-    await startDockerDesktop(emit);
-    const tools = await resolveTools();
-    try { await waitForDockerEngine(tools, emit); }
+    await startDocker(emit);
+    const tools = await getTools();
+    try { await waitForEngine(tools, emit); }
     catch (error) {
       if (!isRecoverableDockerError(error)) throw error;
-      await recoverDockerEngine(emit);
+      await recoverEngine(emit);
     }
   }
 
-  status = await preflight();
+  status = await checkPreflight();
   if (!status.ready) {
-    if (restartRequired) throw new Error('Windows must restart to finish WSL 2 and Docker setup. Restart the PC, reopen ERPNext Desktop, and click Install—the selected apps are saved.');
+    if (restartRequired) throw restartRequiredError();
     throw new Error('Docker Desktop did not become ready. Restart Windows, reopen ERPNext Desktop, and click Install again; no Docker login is required.');
   }
   emit({ kind: 'progress', phase: 'Windows requirements are ready', image: 'WSL 2 + Git + Docker Desktop', line: 'All prerequisites are installed and running.', progress: 24 });
@@ -377,4 +461,4 @@ async function removeWorkspace(appDataDir, options, emit = () => {}) {
   return { removed: true, dataDeleted: deleteData };
 }
 
-module.exports = { preflight, installRequirement, startDockerDesktop, ensureRequirements, makePlan, install, workspaceStatus, removeWorkspace };
+module.exports = { createLineCollector, preflight, installRequirement, startDockerDesktop, ensureRequirements, makePlan, install, workspaceStatus, removeWorkspace };
