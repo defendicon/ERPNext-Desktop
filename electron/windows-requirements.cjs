@@ -124,7 +124,8 @@ function validateRequestedFeatures(featureNames) {
   if (
     !Array.isArray(featureNames) ||
     featureNames.length === 0 ||
-    featureNames.some((featureName) => !allowedFeatures.has(featureName))
+    featureNames.some((featureName) => !allowedFeatures.has(featureName)) ||
+    new Set(featureNames).size !== featureNames.length
   ) {
     throw enablementError();
   }
@@ -197,7 +198,8 @@ function validateEnablementPayload(payload, featureNames) {
 }
 
 async function enableWindowsFeatures(run, featureNames, emit = () => {}) {
-  validateRequestedFeatures(featureNames);
+  const requestedFeatures = Array.isArray(featureNames) ? [...featureNames] : featureNames;
+  validateRequestedFeatures(requestedFeatures);
   emit({
     kind: 'progress',
     phase: 'Enabling Windows virtualization',
@@ -214,7 +216,7 @@ async function enableWindowsFeatures(run, featureNames, emit = () => {}) {
       '-ExecutionPolicy',
       'Bypass',
       '-Command',
-      buildEnablementScript(featureNames)
+      buildEnablementScript(requestedFeatures)
     ], {}, emit);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -222,7 +224,7 @@ async function enableWindowsFeatures(run, featureNames, emit = () => {}) {
   }
 
   const payload = parseEnablementPayload(result?.stdout);
-  validateEnablementPayload(payload, featureNames);
+  validateEnablementPayload(payload, requestedFeatures);
   return {
     restartNeeded: payload.results.some((feature) => feature.restartNeeded === true)
   };

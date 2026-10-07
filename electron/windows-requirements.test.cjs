@@ -216,6 +216,36 @@ test('rejects empty or non-allow-listed feature requests before invoking the run
   }
 });
 
+test('rejects duplicate feature requests before invoking the runner', async () => {
+  let invoked = false;
+  const run = async () => {
+    invoked = true;
+    return enablementOutput([]);
+  };
+
+  await assert.rejects(
+    enableWindowsFeatures(run, [REQUIRED_FEATURES.wsl, REQUIRED_FEATURES.wsl]),
+    /^Error: Unable to enable required Windows virtualization features\./
+  );
+  assert.equal(invoked, false);
+});
+
+test('rejects sparse feature request arrays before invoking the runner', async () => {
+  let invoked = false;
+  const run = async () => {
+    invoked = true;
+    return enablementOutput([]);
+  };
+  const sparseFeatures = [];
+  sparseFeatures.length = 1;
+
+  await assert.rejects(
+    enableWindowsFeatures(run, sparseFeatures),
+    /^Error: Unable to enable required Windows virtualization features\./
+  );
+  assert.equal(invoked, false);
+});
+
 test('runs PowerShell with the exact safe arguments and only requested feature names', async () => {
   let invocation;
   const run = async (...args) => {
@@ -240,6 +270,26 @@ test('runs PowerShell with the exact safe arguments and only requested feature n
   assert.match(script, /Enable-WindowsOptionalFeature\s+-Online\s+-FeatureName\s+\$name\s+-All\s+-NoRestart\s+-PassThru/);
   assert.match(script, /ConvertTo-Json\s+-Compress/);
   assert.match(script, /ERPNextDesktopFeatureEnablement:/);
+});
+
+test('uses the entry snapshot when the progress callback mutates the caller array', async () => {
+  const injection = "Containers'; Write-Output 'injected";
+  const requested = [REQUIRED_FEATURES.wsl];
+  let script;
+  const run = async (_command, args) => {
+    script = args[5];
+    return enablementOutput([
+      enablementResult(REQUIRED_FEATURES.wsl, false)
+    ]);
+  };
+  const emit = () => requested.push(injection);
+
+  assert.deepEqual(
+    await enableWindowsFeatures(run, requested, emit),
+    { restartNeeded: false }
+  );
+  assert.match(script, /'Microsoft-Windows-Subsystem-Linux'/);
+  assert.doesNotMatch(script, /Containers|injected/);
 });
 
 test('reports restart needed when any requested feature requires it', async () => {
