@@ -4,7 +4,8 @@ const assert = require('node:assert/strict');
 const {
   createLineCollector,
   ensureRequirements,
-  preflight
+  preflight,
+  runDocker
 } = require('./installer.cjs');
 const { REQUIRED_FEATURES } = require('./windows-requirements.cjs');
 
@@ -99,6 +100,16 @@ test('line collector caps an unterminated fragment while retaining its diagnosti
   collector.flush();
 
   assert.deepEqual(lines, ['tic-tail']);
+});
+
+test('line collector caps a completed overlong line before emitting its diagnostic tail', () => {
+  const lines = [];
+  const collector = createLineCollector((line) => lines.push(line), 8);
+
+  collector.push('discard-this-diagnostic-tail\nshort\n');
+  collector.flush();
+
+  assert.deepEqual(lines, ['tic-tail', 'short']);
 });
 
 test('production preflight invokes the Windows inspector and gates readiness on both features', async () => {
@@ -317,14 +328,12 @@ test('blocks recovery when prerequisites regress after a recoverable engine wait
   const stopped = status({ engine: false, ready: false });
   const firmwareBlocked = status({ engine: false, ready: false, firmwareVirtualization: false });
   const recoverable = new Error('Docker Desktop is unable to start');
-  const { actions, dependencies } = harness([
-    stopped,
-    stopped,
-    stopped,
-    firmwareBlocked
-  ], {
+  let waitFailed = false;
+  const { actions, dependencies } = harness([stopped], {
+    preflight: async () => waitFailed ? firmwareBlocked : stopped,
     waitForDockerEngine: async () => {
       actions.wait += 1;
+      waitFailed = true;
       throw recoverable;
     }
   });
@@ -347,4 +356,144 @@ test('final preflight reports a prerequisite regression instead of a generic Doc
   assert.equal(actions.start, 0);
   assert.equal(actions.wait, 0);
   assert.equal(actions.recover, 0);
+});
+
+test('a WSL installation restart requirement stops before any Docker installation', async () => {
+  const missing = status({ wsl: false, docker: false, compose: false, engine: false, ready: false });
+  const { actions, dependencies } = harness([missing], {
+    installRequirement: async (id) => {
+      actions.install.push(id);
+      return { id, installed: true, restartRequired: id === 'wsl' };
+    }
+  });
+
+  await assert.rejects(ensureRequirements(() => {}, dependencies), /Windows must restart to finish WSL 2 and virtualization setup/);
+  assert.deepEqual(actions.install, ['wsl']);
+  assert.equal(actions.start, 0);
+  assert.equal(actions.wait, 0);
+  assert.equal(actions.recover, 0);
+});
+
+test('an OS pending restart stops before Docker installation', async () => {
+  const missingDocker = status({ docker: false, compose: false, engine: false, ready: false });
+  const { actions, dependencies } = harness([missingDocker], {
+    windowsRestartPending: async () => true
+  });
+
+  await assert.rejects(ensureRequirements(() => {}, dependencies), /Windows must restart to finish WSL 2 and virtualization setup/);
+  assert.deepEqual(actions.install, []);
+  assert.equal(actions.start, 0);
+});
+
+test('a newly pending OS restart blocks Docker recovery after engine wait failure', async () => {
+  const stopped = status({ engine: false, ready: false });
+  let waitFailed = false;
+  const { actions, dependencies } = harness([stopped], {
+    windowsRestartPending: async () => waitFailed,
+    waitForDockerEngine: async () => {
+      actions.wait += 1;
+      waitFailed = true;
+      throw new Error('Docker Desktop is unable to start');
+    }
+  });
+
+  await assert.rejects(ensureRequirements(() => {}, dependencies), /Windows must restart to finish WSL 2 and virtualization setup/);
+  assert.equal(actions.start, 1);
+  assert.equal(actions.wait, 1);
+  assert.equal(actions.recover, 0);
+});
+
+const runDockerBlockedStates = [
+  {
+    name: 'feature remains disabled',
+    statuses: [
+      status({ features: { virtualMachinePlatform: 'disabled' } }),
+      status({ features: { virtualMachinePlatform: 'disabled' } })
+    ],
+    expected: /Windows could not finish enabling the required virtualization features/
+  },
+  {
+    name: 'feature is restart-pending',
+    statuses: [status({ features: { virtualMachinePlatform: 'restart-pending' } })],
+    expected: /Windows must restart to finish WSL 2 and virtualization setup/
+  },
+  {
+    name: 'firmware virtualization is disabled',
+    statuses: [status({ firmwareVirtualization: false })],
+    expected: /Hardware virtualization is disabled/
+  }
+];
+
+for (const blockedState of runDockerBlockedStates) {
+  test(`runDocker blocks automatic recovery when ${blockedState.name}`, async () => {
+    let recoveries = 0;
+    const recoverable = new Error('Docker Desktop is unable to start');
+
+    await assert.rejects(
+      runDocker(
+        { docker: 'docker.exe' },
+        ['ps'],
+        {},
+        () => {},
+        true,
+        {
+          run: async () => { throw recoverable; },
+          preflight: sequence(blockedState.statuses),
+          enableWindowsFeatures: async () => ({ restartNeeded: false }),
+          windowsRestartPending: async () => false,
+          recoverDockerEngine: async () => { recoveries += 1; }
+        }
+      ),
+      blockedState.expected
+    );
+    assert.equal(recoveries, 0);
+  });
+}
+
+test('runDocker blocks automatic recovery while Windows has an OS pending restart', async () => {
+  let recoveries = 0;
+
+  await assert.rejects(
+    runDocker(
+      { docker: 'docker.exe' },
+      ['ps'],
+      {},
+      () => {},
+      true,
+      {
+        run: async () => { throw new Error('Docker Desktop is unable to start'); },
+        preflight: async () => status(),
+        windowsRestartPending: async () => true,
+        recoverDockerEngine: async () => { recoveries += 1; }
+      }
+    ),
+    /Windows must restart to finish WSL 2 and virtualization setup/
+  );
+  assert.equal(recoveries, 0);
+});
+
+test('runDocker recovers once and retries when shared Docker prerequisites are healthy', async () => {
+  let runs = 0;
+  let recoveries = 0;
+  const result = await runDocker(
+    { docker: 'docker.exe' },
+    ['ps'],
+    {},
+    () => {},
+    true,
+    {
+      run: async () => {
+        runs += 1;
+        if (runs === 1) throw new Error('Docker Desktop is unable to start');
+        return { stdout: 'ready', stderr: '' };
+      },
+      preflight: async () => status(),
+      windowsRestartPending: async () => false,
+      recoverDockerEngine: async () => { recoveries += 1; }
+    }
+  );
+
+  assert.equal(result.stdout, 'ready');
+  assert.equal(runs, 2);
+  assert.equal(recoveries, 1);
 });

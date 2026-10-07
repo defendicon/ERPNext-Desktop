@@ -33,7 +33,7 @@ function createLineCollector(onLine, maxFragmentLength = MAX_LINE_FRAGMENT_LENGT
     while (newlineIndex !== -1) {
       const line = remainder.slice(0, newlineIndex).replace(/\r$/, '');
       remainder = remainder.slice(newlineIndex + 1);
-      if (line) onLine(line);
+      if (line) onLine(line.length > maxFragmentLength ? line.slice(-maxFragmentLength) : line);
       newlineIndex = remainder.indexOf('\n');
     }
     if (remainder.length > maxFragmentLength) {
@@ -241,13 +241,21 @@ async function recoverDockerEngine(emit = () => {}) {
   return true;
 }
 
-async function runDocker(tools, args, options, onLine, allowRecovery = true) {
+async function runDocker(tools, args, options, onLine, allowRecovery = true, dependencies = {}) {
+  const execute = dependencies.run || run;
+  const recoverEngine = dependencies.recoverDockerEngine || recoverDockerEngine;
   try {
-    return await run(tools.docker, args, options, onLine);
+    return await execute(tools.docker, args, options, onLine);
   } catch (error) {
     if (!allowRecovery || !isRecoverableDockerError(error)) throw error;
-    await recoverDockerEngine(onLine);
-    return run(tools.docker, args, options, onLine);
+    await guardDockerMutation({
+      checkPreflight: dependencies.preflight || preflight,
+      enableFeatures: dependencies.enableWindowsFeatures || ((names, report) => enableWindowsFeatures(run, names, report)),
+      hasPendingRestart: dependencies.windowsRestartPending || windowsRestartPending,
+      emit: onLine
+    });
+    await recoverEngine(onLine);
+    return execute(tools.docker, args, options, onLine);
   }
 }
 
@@ -289,6 +297,17 @@ async function enforceWindowsPrerequisites(status, checkPreflight, enableFeature
   return updatedStatus;
 }
 
+async function guardDockerMutation({
+  restartRequired = false,
+  checkPreflight = preflight,
+  enableFeatures = (names, report) => enableWindowsFeatures(run, names, report),
+  hasPendingRestart = windowsRestartPending,
+  emit = () => {}
+} = {}) {
+  if (restartRequired || await hasPendingRestart()) throw restartRequiredError();
+  return enforceWindowsPrerequisites(await checkPreflight(), checkPreflight, enableFeatures, emit);
+}
+
 async function ensureRequirements(emit = () => {}, dependencies = {}) {
   const checkPreflight = dependencies.preflight || preflight;
   const enableFeatures = dependencies.enableWindowsFeatures || ((names, report) => enableWindowsFeatures(run, names, report));
@@ -298,22 +317,25 @@ async function ensureRequirements(emit = () => {}, dependencies = {}) {
   const getTools = dependencies.resolveTools || resolveTools;
   const waitForEngine = dependencies.waitForDockerEngine || waitForDockerEngine;
   const recoverEngine = dependencies.recoverDockerEngine || recoverDockerEngine;
-  const enforcePrerequisites = (currentStatus) => enforceWindowsPrerequisites(
-    currentStatus,
-    checkPreflight,
-    enableFeatures,
-    emit
-  );
+  const enforcePrerequisites = (currentStatus) => enforceWindowsPrerequisites(currentStatus, checkPreflight, enableFeatures, emit);
 
   emit({ kind: 'progress', phase: 'Checking Windows requirements', image: 'System readiness scan', line: 'Checking WSL, Git, Docker Desktop and Docker Compose.', progress: 2 });
   let status = await enforcePrerequisites(await checkPreflight());
   let restartRequired = false;
+  const guardDocker = () => guardDockerMutation({
+    restartRequired,
+    checkPreflight,
+    enableFeatures,
+    hasPendingRestart,
+    emit
+  });
 
   if (!status.wsl) {
     emit({ kind: 'progress', phase: 'Installing Windows Subsystem for Linux', image: 'Microsoft.WSL', line: 'Downloading and enabling WSL 2 silently.', progress: 5 });
     emit({ kind: 'progress', line: 'Enabling Windows Subsystem for Linux…', progress: 4 });
     const result = await installMissingRequirement('wsl', emit);
     restartRequired ||= result.restartRequired;
+    if (restartRequired) throw restartRequiredError();
   }
   if (!status.git) {
     emit({ kind: 'progress', phase: 'Installing Git', image: 'Git.Git', line: 'Downloading the verified Git for Windows package.', progress: 9 });
@@ -321,25 +343,18 @@ async function ensureRequirements(emit = () => {}, dependencies = {}) {
     await installMissingRequirement('git', emit);
   }
 
-  status = await enforcePrerequisites(await checkPreflight());
+  status = await guardDocker();
   if (!status.docker || !status.compose) {
-    status = await enforcePrerequisites(status);
     emit({ kind: 'progress', phase: 'Installing Docker Desktop', image: 'Docker.DockerDesktop', line: 'Downloading Docker Desktop and Docker Compose silently.', progress: 14 });
     emit({ kind: 'progress', line: 'Installing Docker Desktop and Docker Compose…', progress: 11 });
     const result = await installMissingRequirement('docker', emit);
     restartRequired ||= result.restartRequired;
+    if (restartRequired) throw restartRequiredError();
   }
 
-  if (restartRequired) {
-    throw restartRequiredError();
-  }
-
-  status = await enforcePrerequisites(await checkPreflight());
-  if (!status.engine && await hasPendingRestart()) {
-    throw restartRequiredError();
-  }
+  status = await guardDocker();
   if (!status.engine && status.docker) {
-    status = await enforcePrerequisites(status);
+    status = await guardDocker();
     emit({ kind: 'progress', phase: 'Starting the container engine', image: 'Docker Desktop', line: 'Starting Docker Desktop in the background.', progress: 20 });
     emit({ kind: 'progress', line: 'Starting Docker Desktop…', progress: 14 });
     await startDocker(emit);
@@ -347,12 +362,12 @@ async function ensureRequirements(emit = () => {}, dependencies = {}) {
     try { await waitForEngine(tools, emit); }
     catch (error) {
       if (!isRecoverableDockerError(error)) throw error;
-      status = await enforcePrerequisites(await checkPreflight());
+      status = await guardDocker();
       await recoverEngine(emit);
     }
   }
 
-  status = await enforcePrerequisites(await checkPreflight());
+  status = await guardDocker();
   if (!status.ready) {
     if (restartRequired) throw restartRequiredError();
     throw new Error('Docker Desktop did not become ready. Restart Windows, reopen ERPNext Desktop, and click Install again; no Docker login is required.');
@@ -492,4 +507,4 @@ async function removeWorkspace(appDataDir, options, emit = () => {}) {
   return { removed: true, dataDeleted: deleteData };
 }
 
-module.exports = { createLineCollector, preflight, installRequirement, startDockerDesktop, ensureRequirements, makePlan, install, workspaceStatus, removeWorkspace };
+module.exports = { createLineCollector, preflight, installRequirement, startDockerDesktop, ensureRequirements, runDocker, makePlan, install, workspaceStatus, removeWorkspace };
