@@ -299,13 +299,16 @@ async function enforceWindowsPrerequisites(status, checkPreflight, enableFeature
 
 async function guardDockerMutation({
   restartRequired = false,
+  status,
   checkPreflight = preflight,
   enableFeatures = (names, report) => enableWindowsFeatures(run, names, report),
   hasPendingRestart = windowsRestartPending,
   emit = () => {}
 } = {}) {
+  const currentStatus = status || await checkPreflight();
+  assertPrerequisiteBlockers(currentStatus);
   if (restartRequired || await hasPendingRestart()) throw restartRequiredError();
-  return enforceWindowsPrerequisites(await checkPreflight(), checkPreflight, enableFeatures, emit);
+  return enforceWindowsPrerequisites(currentStatus, checkPreflight, enableFeatures, emit);
 }
 
 async function ensureRequirements(emit = () => {}, dependencies = {}) {
@@ -322,8 +325,9 @@ async function ensureRequirements(emit = () => {}, dependencies = {}) {
   emit({ kind: 'progress', phase: 'Checking Windows requirements', image: 'System readiness scan', line: 'Checking WSL, Git, Docker Desktop and Docker Compose.', progress: 2 });
   let status = await enforcePrerequisites(await checkPreflight());
   let restartRequired = false;
-  const guardDocker = () => guardDockerMutation({
+  const guardDocker = (currentStatus) => guardDockerMutation({
     restartRequired,
+    status: currentStatus,
     checkPreflight,
     enableFeatures,
     hasPendingRestart,
@@ -343,8 +347,9 @@ async function ensureRequirements(emit = () => {}, dependencies = {}) {
     await installMissingRequirement('git', emit);
   }
 
-  status = await guardDocker();
+  status = await enforcePrerequisites(await checkPreflight());
   if (!status.docker || !status.compose) {
+    status = await guardDocker(status);
     emit({ kind: 'progress', phase: 'Installing Docker Desktop', image: 'Docker.DockerDesktop', line: 'Downloading Docker Desktop and Docker Compose silently.', progress: 14 });
     emit({ kind: 'progress', line: 'Installing Docker Desktop and Docker Compose…', progress: 11 });
     const result = await installMissingRequirement('docker', emit);
@@ -352,9 +357,9 @@ async function ensureRequirements(emit = () => {}, dependencies = {}) {
     if (restartRequired) throw restartRequiredError();
   }
 
-  status = await guardDocker();
+  status = await enforcePrerequisites(await checkPreflight());
   if (!status.engine && status.docker) {
-    status = await guardDocker();
+    status = await guardDocker(status);
     emit({ kind: 'progress', phase: 'Starting the container engine', image: 'Docker Desktop', line: 'Starting Docker Desktop in the background.', progress: 20 });
     emit({ kind: 'progress', line: 'Starting Docker Desktop…', progress: 14 });
     await startDocker(emit);
@@ -367,7 +372,7 @@ async function ensureRequirements(emit = () => {}, dependencies = {}) {
     }
   }
 
-  status = await guardDocker();
+  status = await enforcePrerequisites(await checkPreflight());
   if (!status.ready) {
     if (restartRequired) throw restartRequiredError();
     throw new Error('Docker Desktop did not become ready. Restart Windows, reopen ERPNext Desktop, and click Install again; no Docker login is required.');

@@ -472,6 +472,40 @@ test('runDocker blocks automatic recovery while Windows has an OS pending restar
   assert.equal(recoveries, 0);
 });
 
+test('runDocker reports firmware virtualization before a simultaneous OS pending restart', async () => {
+  let recoveries = 0;
+
+  await assert.rejects(
+    runDocker(
+      { docker: 'docker.exe' },
+      ['ps'],
+      {},
+      () => {},
+      true,
+      {
+        run: async () => { throw new Error('Docker Desktop is unable to start'); },
+        preflight: async () => status({ firmwareVirtualization: false }),
+        windowsRestartPending: async () => true,
+        recoverDockerEngine: async () => { recoveries += 1; }
+      }
+    ),
+    /Hardware virtualization is disabled/
+  );
+  assert.equal(recoveries, 0);
+});
+
+test('healthy running Docker is not blocked by an unrelated OS pending restart', async () => {
+  const ready = status();
+  const { actions, dependencies } = harness([ready], {
+    windowsRestartPending: async () => true
+  });
+
+  const result = await ensureRequirements(() => {}, dependencies);
+
+  assert.equal(result.ready, true);
+  assert.deepEqual(actions, { enable: [], install: [], start: 0, wait: 0, recover: 0 });
+});
+
 test('runDocker recovers once and retries when shared Docker prerequisites are healthy', async () => {
   let runs = 0;
   let recoveries = 0;
