@@ -78,6 +78,29 @@ test('line collector reconstructs a marker JSON line split across process chunks
   ]);
 });
 
+test('line collector reconstructs UTF-8 characters split across Buffer chunks', () => {
+  const lines = [];
+  const collector = createLineCollector((line) => lines.push(line));
+  const encoded = Buffer.from('virtualisation café\n', 'utf8');
+  const splitAt = encoded.indexOf(0xc3) + 1;
+
+  collector.push(encoded.subarray(0, splitAt));
+  collector.push(encoded.subarray(splitAt));
+  collector.flush();
+
+  assert.deepEqual(lines, ['virtualisation café']);
+});
+
+test('line collector caps an unterminated fragment while retaining its diagnostic tail', () => {
+  const lines = [];
+  const collector = createLineCollector((line) => lines.push(line), 8);
+
+  collector.push('discard-this-diagnostic-tail');
+  collector.flush();
+
+  assert.deepEqual(lines, ['tic-tail']);
+});
+
 test('production preflight invokes the Windows inspector and gates readiness on both features', async () => {
   let inspections = 0;
   const dependencies = {
@@ -234,4 +257,94 @@ test('fails safely when enabled features do not become enabled after reinspectio
   );
   assert.deepEqual(actions.install, []);
   assert.equal(actions.start, 0);
+});
+
+const laterBlockedStates = [
+  {
+    name: 'disabled',
+    blocked: status({ features: { virtualMachinePlatform: 'disabled' } }),
+    expected: /Windows could not finish enabling the required virtualization features/,
+    needsReinspection: true
+  },
+  {
+    name: 'restart-pending',
+    blocked: status({ features: { virtualMachinePlatform: 'restart-pending' } }),
+    expected: /Windows must restart to finish WSL 2 and virtualization setup/
+  },
+  {
+    name: 'unknown',
+    blocked: status({ features: { virtualMachinePlatform: 'unknown' } }),
+    expected: /Unable to inspect required Windows virtualization features\. No changes were made\./
+  },
+  {
+    name: 'firmware-disabled',
+    blocked: status({ firmwareVirtualization: false }),
+    expected: /Hardware virtualization is disabled/
+  }
+];
+
+for (const blockedState of laterBlockedStates) {
+  test(`blocks Docker installation when prerequisites become ${blockedState.name} after WSL handling`, async () => {
+    const statuses = [
+      status({ wsl: false, ready: false }),
+      blockedState.blocked
+    ];
+    if (blockedState.needsReinspection) statuses.push(blockedState.blocked);
+    const { actions, dependencies } = harness(statuses);
+
+    await assert.rejects(ensureRequirements(() => {}, dependencies), blockedState.expected);
+    assert.equal(actions.install.includes('docker'), false);
+    assert.equal(actions.start, 0);
+    assert.equal(actions.wait, 0);
+    assert.equal(actions.recover, 0);
+  });
+
+  test(`blocks Docker startup when prerequisites become ${blockedState.name} after Docker installation`, async () => {
+    const missingDocker = status({ docker: false, compose: false, engine: false, ready: false });
+    const statuses = [missingDocker, missingDocker, blockedState.blocked];
+    if (blockedState.needsReinspection) statuses.push(blockedState.blocked);
+    const { actions, dependencies } = harness(statuses);
+
+    await assert.rejects(ensureRequirements(() => {}, dependencies), blockedState.expected);
+    assert.deepEqual(actions.install, ['docker']);
+    assert.equal(actions.start, 0);
+    assert.equal(actions.wait, 0);
+    assert.equal(actions.recover, 0);
+  });
+}
+
+test('blocks recovery when prerequisites regress after a recoverable engine wait failure', async () => {
+  const stopped = status({ engine: false, ready: false });
+  const firmwareBlocked = status({ engine: false, ready: false, firmwareVirtualization: false });
+  const recoverable = new Error('Docker Desktop is unable to start');
+  const { actions, dependencies } = harness([
+    stopped,
+    stopped,
+    stopped,
+    firmwareBlocked
+  ], {
+    waitForDockerEngine: async () => {
+      actions.wait += 1;
+      throw recoverable;
+    }
+  });
+
+  await assert.rejects(ensureRequirements(() => {}, dependencies), /Hardware virtualization is disabled/);
+  assert.equal(actions.start, 1);
+  assert.equal(actions.wait, 1);
+  assert.equal(actions.recover, 0);
+});
+
+test('final preflight reports a prerequisite regression instead of a generic Docker error', async () => {
+  const running = status();
+  const unknown = status({ features: { wsl: 'unknown' }, ready: false });
+  const { actions, dependencies } = harness([running, running, running, unknown]);
+
+  await assert.rejects(
+    ensureRequirements(() => {}, dependencies),
+    /Unable to inspect required Windows virtualization features\. No changes were made\./
+  );
+  assert.equal(actions.start, 0);
+  assert.equal(actions.wait, 0);
+  assert.equal(actions.recover, 0);
 });

@@ -3,6 +3,7 @@ const { mkdir, writeFile, access, rm } = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const net = require('node:net');
+const { StringDecoder } = require('node:string_decoder');
 const {
   REQUIRED_FEATURES,
   enableWindowsFeatures,
@@ -22,20 +23,32 @@ const APP_CATALOG = {
   wiki: { url: 'https://github.com/frappe/wiki', branches: { 15: 'master', 16: 'master' } }
 };
 
-function createLineCollector(onLine) {
+const MAX_LINE_FRAGMENT_LENGTH = 64 * 1024;
+
+function createLineCollector(onLine, maxFragmentLength = MAX_LINE_FRAGMENT_LENGTH) {
+  const decoder = new StringDecoder('utf8');
   let remainder = '';
+  const drainCompleteLines = () => {
+    let newlineIndex = remainder.indexOf('\n');
+    while (newlineIndex !== -1) {
+      const line = remainder.slice(0, newlineIndex).replace(/\r$/, '');
+      remainder = remainder.slice(newlineIndex + 1);
+      if (line) onLine(line);
+      newlineIndex = remainder.indexOf('\n');
+    }
+    if (remainder.length > maxFragmentLength) {
+      remainder = remainder.slice(-maxFragmentLength);
+    }
+  };
   return {
     push(chunk) {
-      remainder += String(chunk);
-      let newlineIndex = remainder.indexOf('\n');
-      while (newlineIndex !== -1) {
-        const line = remainder.slice(0, newlineIndex).replace(/\r$/, '');
-        remainder = remainder.slice(newlineIndex + 1);
-        if (line) onLine(line);
-        newlineIndex = remainder.indexOf('\n');
-      }
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      remainder += decoder.write(buffer);
+      drainCompleteLines();
     },
     flush() {
+      remainder += decoder.end();
+      drainCompleteLines();
       const line = remainder.replace(/\r$/, '');
       remainder = '';
       if (line) onLine(line);
@@ -242,6 +255,40 @@ function restartRequiredError() {
   return new Error('Windows must restart to finish WSL 2 and virtualization setup. Restart Windows, reopen ERPNext Desktop, and click Install—the selected apps are saved and no Docker login is required.');
 }
 
+function requiredFeatureStates(status) {
+  return Object.keys(REQUIRED_FEATURES).map((id) => status.features?.[id]);
+}
+
+function assertPrerequisiteBlockers(status) {
+  if (status.firmwareVirtualization === false) {
+    throw new Error('Hardware virtualization is disabled. Enable Intel VT-x/VT-d or AMD-V/SVM in BIOS/UEFI, restart Windows, then reopen ERPNext Desktop. This firmware setting cannot be enabled automatically.');
+  }
+
+  const states = requiredFeatureStates(status);
+  if (states.includes('restart-pending')) throw restartRequiredError();
+  if (states.some((state) => state === 'unknown' || !['enabled', 'disabled', 'restart-pending'].includes(state))) {
+    throw new Error('Unable to inspect required Windows virtualization features. No changes were made.');
+  }
+}
+
+async function enforceWindowsPrerequisites(status, checkPreflight, enableFeatures, emit) {
+  assertPrerequisiteBlockers(status);
+  const missingFeatures = Object.entries(REQUIRED_FEATURES)
+    .filter(([id]) => status.features[id] === 'disabled')
+    .map(([, featureName]) => featureName);
+  if (missingFeatures.length === 0) return status;
+
+  const result = await enableFeatures(missingFeatures, emit);
+  if (result.restartNeeded) throw restartRequiredError();
+
+  const updatedStatus = await checkPreflight();
+  assertPrerequisiteBlockers(updatedStatus);
+  if (requiredFeatureStates(updatedStatus).some((state) => state !== 'enabled')) {
+    throw new Error('Windows could not finish enabling the required virtualization features. Restart Windows, reopen ERPNext Desktop, and click Install again.');
+  }
+  return updatedStatus;
+}
+
 async function ensureRequirements(emit = () => {}, dependencies = {}) {
   const checkPreflight = dependencies.preflight || preflight;
   const enableFeatures = dependencies.enableWindowsFeatures || ((names, report) => enableWindowsFeatures(run, names, report));
@@ -251,35 +298,16 @@ async function ensureRequirements(emit = () => {}, dependencies = {}) {
   const getTools = dependencies.resolveTools || resolveTools;
   const waitForEngine = dependencies.waitForDockerEngine || waitForDockerEngine;
   const recoverEngine = dependencies.recoverDockerEngine || recoverDockerEngine;
+  const enforcePrerequisites = (currentStatus) => enforceWindowsPrerequisites(
+    currentStatus,
+    checkPreflight,
+    enableFeatures,
+    emit
+  );
 
   emit({ kind: 'progress', phase: 'Checking Windows requirements', image: 'System readiness scan', line: 'Checking WSL, Git, Docker Desktop and Docker Compose.', progress: 2 });
-  let status = await checkPreflight();
+  let status = await enforcePrerequisites(await checkPreflight());
   let restartRequired = false;
-
-  if (status.firmwareVirtualization === false) {
-    throw new Error('Hardware virtualization is disabled. Enable Intel VT-x/VT-d or AMD-V/SVM in BIOS/UEFI, restart Windows, then reopen ERPNext Desktop. This firmware setting cannot be enabled automatically.');
-  }
-
-  const initialFeatureStates = Object.values(status.features);
-  if (initialFeatureStates.includes('restart-pending')) throw restartRequiredError();
-  if (initialFeatureStates.includes('unknown')) {
-    throw new Error('Unable to inspect required Windows virtualization features. No changes were made.');
-  }
-
-  const missingFeatures = Object.entries(status.features)
-    .filter(([, state]) => state === 'disabled')
-    .map(([id]) => REQUIRED_FEATURES[id]);
-  if (missingFeatures.length > 0) {
-    const result = await enableFeatures(missingFeatures, emit);
-    if (result.restartNeeded) throw restartRequiredError();
-
-    status = await checkPreflight();
-    const updatedFeatureStates = Object.values(status.features);
-    if (updatedFeatureStates.includes('restart-pending')) throw restartRequiredError();
-    if (updatedFeatureStates.some((state) => state !== 'enabled')) {
-      throw new Error('Windows could not finish enabling the required virtualization features. Restart Windows, reopen ERPNext Desktop, and click Install again.');
-    }
-  }
 
   if (!status.wsl) {
     emit({ kind: 'progress', phase: 'Installing Windows Subsystem for Linux', image: 'Microsoft.WSL', line: 'Downloading and enabling WSL 2 silently.', progress: 5 });
@@ -293,8 +321,9 @@ async function ensureRequirements(emit = () => {}, dependencies = {}) {
     await installMissingRequirement('git', emit);
   }
 
-  status = await checkPreflight();
+  status = await enforcePrerequisites(await checkPreflight());
   if (!status.docker || !status.compose) {
+    status = await enforcePrerequisites(status);
     emit({ kind: 'progress', phase: 'Installing Docker Desktop', image: 'Docker.DockerDesktop', line: 'Downloading Docker Desktop and Docker Compose silently.', progress: 14 });
     emit({ kind: 'progress', line: 'Installing Docker Desktop and Docker Compose…', progress: 11 });
     const result = await installMissingRequirement('docker', emit);
@@ -305,11 +334,12 @@ async function ensureRequirements(emit = () => {}, dependencies = {}) {
     throw restartRequiredError();
   }
 
-  status = await checkPreflight();
+  status = await enforcePrerequisites(await checkPreflight());
   if (!status.engine && await hasPendingRestart()) {
     throw restartRequiredError();
   }
   if (!status.engine && status.docker) {
+    status = await enforcePrerequisites(status);
     emit({ kind: 'progress', phase: 'Starting the container engine', image: 'Docker Desktop', line: 'Starting Docker Desktop in the background.', progress: 20 });
     emit({ kind: 'progress', line: 'Starting Docker Desktop…', progress: 14 });
     await startDocker(emit);
@@ -317,11 +347,12 @@ async function ensureRequirements(emit = () => {}, dependencies = {}) {
     try { await waitForEngine(tools, emit); }
     catch (error) {
       if (!isRecoverableDockerError(error)) throw error;
+      status = await enforcePrerequisites(await checkPreflight());
       await recoverEngine(emit);
     }
   }
 
-  status = await checkPreflight();
+  status = await enforcePrerequisites(await checkPreflight());
   if (!status.ready) {
     if (restartRequired) throw restartRequiredError();
     throw new Error('Docker Desktop did not become ready. Restart Windows, reopen ERPNext Desktop, and click Install again; no Docker login is required.');
