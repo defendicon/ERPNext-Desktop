@@ -3,11 +3,13 @@ const assert = require('node:assert/strict');
 
 const {
   REQUIRED_FEATURES,
+  enableWindowsFeatures,
   inspectWindowsRequirements,
   normalizeFeatureState
 } = require('./windows-requirements.cjs');
 
 const MARKER = 'ERPNextDesktopRequirements:';
+const ENABLEMENT_MARKER = 'ERPNextDesktopFeatureEnablement:';
 const FEATURE_STATES = {
   'Microsoft-Windows-Subsystem-Linux': 'Enabled',
   VirtualMachinePlatform: 'Enabled'
@@ -27,6 +29,17 @@ function payload(overrides = {}) {
     hypervisorPresent: false,
     ...overrides
   };
+}
+
+function enablementOutput(results) {
+  return {
+    stdout: `${ENABLEMENT_MARKER}${JSON.stringify({ results })}`,
+    stderr: ''
+  };
+}
+
+function enablementResult(featureName, restartNeeded) {
+  return { featureName, restartNeeded };
 }
 
 test('exports the exact required Windows feature names', () => {
@@ -185,4 +198,141 @@ test('wraps runner failures while preserving the sanitized diagnostic', async ()
       return true;
     }
   );
+});
+
+test('rejects empty or non-allow-listed feature requests before invoking the runner', async () => {
+  for (const featureNames of [[], ['Containers'], [REQUIRED_FEATURES.wsl, 'Containers']]) {
+    let invoked = false;
+    const run = async () => {
+      invoked = true;
+      return enablementOutput([]);
+    };
+
+    await assert.rejects(
+      enableWindowsFeatures(run, featureNames),
+      /^Error: Unable to enable required Windows virtualization features\./
+    );
+    assert.equal(invoked, false);
+  }
+});
+
+test('runs PowerShell with the exact safe arguments and only requested feature names', async () => {
+  let invocation;
+  const run = async (...args) => {
+    invocation = args;
+    return enablementOutput([
+      enablementResult(REQUIRED_FEATURES.wsl, false)
+    ]);
+  };
+
+  await enableWindowsFeatures(run, [REQUIRED_FEATURES.wsl]);
+
+  assert.equal(invocation[0], 'powershell.exe');
+  assert.deepEqual(invocation[1].slice(0, 5), [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command'
+  ]);
+  assert.equal(invocation[1].length, 6);
+  const script = invocation[1][5];
+  assert.match(script, /\$ErrorActionPreference\s*=\s*'Stop'/);
+  assert.match(script, /\$featureNames\s*=\s*@\([\s\S]*'Microsoft-Windows-Subsystem-Linux'[\s\S]*\)/);
+  assert.doesNotMatch(script, /VirtualMachinePlatform/);
+  assert.match(script, /foreach\s*\(\$name\s+in\s+\$featureNames\)/);
+  assert.match(script, /Enable-WindowsOptionalFeature\s+-Online\s+-FeatureName\s+\$name\s+-All\s+-NoRestart\s+-PassThru/);
+  assert.match(script, /ConvertTo-Json\s+-Compress/);
+  assert.match(script, /ERPNextDesktopFeatureEnablement:/);
+});
+
+test('reports restart needed when any requested feature requires it', async () => {
+  const run = async () => enablementOutput([
+    enablementResult(REQUIRED_FEATURES.wsl, false),
+    enablementResult(REQUIRED_FEATURES.virtualMachinePlatform, true)
+  ]);
+
+  assert.deepEqual(
+    await enableWindowsFeatures(run, Object.values(REQUIRED_FEATURES)),
+    { restartNeeded: true }
+  );
+});
+
+test('reports no restart when every requested feature returns false', async () => {
+  const run = async () => enablementOutput([
+    enablementResult(REQUIRED_FEATURES.wsl, false),
+    enablementResult(REQUIRED_FEATURES.virtualMachinePlatform, false)
+  ]);
+
+  assert.deepEqual(
+    await enableWindowsFeatures(run, Object.values(REQUIRED_FEATURES)),
+    { restartNeeded: false }
+  );
+});
+
+test('rejects malformed marked enablement JSON', async () => {
+  const run = async () => ({
+    stdout: `${ENABLEMENT_MARKER}{not-json`,
+    stderr: ''
+  });
+
+  await assert.rejects(
+    enableWindowsFeatures(run, [REQUIRED_FEATURES.wsl]),
+    /^Error: Unable to enable required Windows virtualization features\./
+  );
+});
+
+test('rejects partial, mismatched, extra, or non-boolean enablement results', async () => {
+  const requested = Object.values(REQUIRED_FEATURES);
+  const invalidResults = [
+    [enablementResult(REQUIRED_FEATURES.wsl, false)],
+    [
+      enablementResult(REQUIRED_FEATURES.wsl, false),
+      enablementResult('Containers', false)
+    ],
+    [
+      enablementResult(REQUIRED_FEATURES.wsl, false),
+      enablementResult(REQUIRED_FEATURES.virtualMachinePlatform, false),
+      enablementResult(REQUIRED_FEATURES.virtualMachinePlatform, false)
+    ],
+    [
+      enablementResult(REQUIRED_FEATURES.wsl, false),
+      enablementResult(REQUIRED_FEATURES.virtualMachinePlatform, 'false')
+    ]
+  ];
+
+  for (const results of invalidResults) {
+    const run = async () => enablementOutput(results);
+    await assert.rejects(
+      enableWindowsFeatures(run, requested),
+      /^Error: Unable to enable required Windows virtualization features\./
+    );
+  }
+});
+
+test('wraps enablement runner failures while preserving the sanitized diagnostic', async () => {
+  const diagnostic = 'powershell.exe exited with code 1:\nAccess denied';
+  const run = async () => { throw new Error(diagnostic); };
+
+  await assert.rejects(
+    enableWindowsFeatures(run, [REQUIRED_FEATURES.wsl]),
+    (error) => {
+      assert.match(error.message, /^Unable to enable required Windows virtualization features\./);
+      assert.match(error.message, /powershell\.exe exited with code 1:\nAccess denied$/);
+      return true;
+    }
+  );
+});
+
+test('emits the exact Windows virtualization enablement progress event', async () => {
+  const events = [];
+  const run = async () => enablementOutput([
+    enablementResult(REQUIRED_FEATURES.wsl, false)
+  ]);
+
+  await enableWindowsFeatures(run, [REQUIRED_FEATURES.wsl], (event) => events.push(event));
+
+  assert.deepEqual(events, [{
+    kind: 'progress',
+    phase: 'Enabling Windows virtualization',
+    image: 'WSL 2 + Virtual Machine Platform',
+    line: 'Enabling the Windows features required by Docker Desktop.',
+    progress: 5
+  }]);
 });
